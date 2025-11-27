@@ -1,6 +1,5 @@
 build/
 build.ps1
-bin/
 config.yaml
 hosts.txt
 rule.txt
