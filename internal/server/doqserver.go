@@ -45,11 +45,23 @@ func (s *DoQServer) Start() {
 			NextProtos:     []string{"doq"},
 		}
 	} else {
-		certs, err := util.LoadServerCertificate("server.crt", "server.key")
-		if err != nil {
-			log.Printf("Warning: DoQ 服务器无法加载证书: %v", err)
-			return
+		var certs []tls.Certificate
+		var err error
+
+		if len(s.cfg.TLSCertificates) > 0 {
+			certs, err = util.LoadServerCertificates(s.cfg.TLSCertificates)
+			if err != nil {
+				log.Printf("Warning: DoQ 服务器无法加载配置的证书: %v", err)
+				return
+			}
+		} else {
+			certs, err = util.LoadServerCertificate("server.crt", "server.key")
+			if err != nil {
+				log.Printf("Warning: DoQ 服务器无法加载默认证书: %v", err)
+				return
+			}
 		}
+
 		tlsConfig = &tls.Config{
 			Certificates: certs,
 			NextProtos:   []string{"doq"},

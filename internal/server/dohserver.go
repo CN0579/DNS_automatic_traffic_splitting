@@ -29,7 +29,15 @@ type DoHServer struct {
 }
 
 func NewDoHServer(cfg *config.Config, r *router.Router, cm *util.CertManager) *DoHServer {
-	dohHandler := &DoHRequestHandler{router: r}
+	dohPath := cfg.Listen.DoHPath
+	if dohPath == "" {
+		dohPath = "/dns-query"
+	}
+
+	dohHandler := &DoHRequestHandler{
+		router: r,
+		path:   dohPath,
+	}
 
 	var tlsConfig *tls.Config
 
@@ -40,11 +48,23 @@ func NewDoHServer(cfg *config.Config, r *router.Router, cm *util.CertManager) *D
 			NextProtos:     []string{"h3", "h2", "http/1.1"},
 		}
 	} else {
-		certs, err := util.LoadServerCertificate("server.crt", "server.key")
-		if err != nil {
-			log.Printf("Warning: DoH 服务器无法加载证书: %v", err)
-			return nil
+		var certs []tls.Certificate
+		var err error
+
+		if len(cfg.TLSCertificates) > 0 {
+			certs, err = util.LoadServerCertificates(cfg.TLSCertificates)
+			if err != nil {
+				log.Printf("Warning: DoH 服务器无法加载配置的证书: %v", err)
+				return nil
+			}
+		} else {
+			certs, err = util.LoadServerCertificate("server.crt", "server.key")
+			if err != nil {
+				log.Printf("Warning: DoH 服务器无法加载默认证书: %v", err)
+				return nil
+			}
 		}
+
 		tlsConfig = &tls.Config{
 			Certificates: certs,
 			NextProtos:   []string{"h3", "h2", "http/1.1"},
@@ -84,7 +104,7 @@ func (s *DoHServer) Start() {
 	}
 
 	go func() {
-		log.Printf("Starting DoH (HTTP/1.1, HTTP/2) server on %s", s.http2Server.Addr)
+		log.Printf("Starting DoH (HTTP/1.1, HTTP/2) server on %s%s", s.http2Server.Addr, s.cfg.Listen.DoHPath)
 		err := s.http2Server.ListenAndServeTLS("", "")
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("无法启动DoH (HTTP/1.1, HTTP/2) 服务器: %v", err)
@@ -92,7 +112,7 @@ func (s *DoHServer) Start() {
 	}()
 
 	go func() {
-		log.Printf("Starting DoH (HTTP/3) server on %s", s.http3Server.Addr)
+		log.Printf("Starting DoH (HTTP/3) server on %s%s", s.http3Server.Addr, s.cfg.Listen.DoHPath)
 
 		udpPort := util.ParsePort(s.http3Server.Addr)
 		udpAddr := &net.UDPAddr{Port: udpPort}
@@ -128,10 +148,11 @@ func (s *DoHServer) Stop() error {
 
 type DoHRequestHandler struct {
 	router *router.Router
+	path   string
 }
 
 func (h *DoHRequestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/dns-query" {
+	if r.URL.Path != h.path {
 		http.NotFound(w, r)
 		return
 	}
@@ -206,3 +227,4 @@ func (h *DoHRequestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(packedResp)
 }
+

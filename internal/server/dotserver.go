@@ -30,11 +30,23 @@ func NewDoTServer(cfg *config.Config, r *router.Router, cm *util.CertManager) *D
 			NextProtos:     []string{"dns", "h2", "http/1.1"},
 		}
 	} else {
-		certs, err := util.LoadServerCertificate("server.crt", "server.key")
-		if err != nil {
-			log.Printf("Warning: DoT 服务器无法加载证书: %v", err)
-			return nil
+		var certs []tls.Certificate
+		var err error
+
+		if len(cfg.TLSCertificates) > 0 {
+			certs, err = util.LoadServerCertificates(cfg.TLSCertificates)
+			if err != nil {
+				log.Printf("Warning: DoT 服务器无法加载配置的证书: %v", err)
+				return nil
+			}
+		} else {
+			certs, err = util.LoadServerCertificate("server.crt", "server.key")
+			if err != nil {
+				log.Printf("Warning: DoT 服务器无法加载默认证书: %v", err)
+				return nil
+			}
 		}
+
 		tlsConfig = &tls.Config{
 			Certificates: certs,
 			NextProtos:   []string{"dns", "h2", "http/1.1"},

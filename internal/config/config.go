@@ -11,15 +11,21 @@ import (
 )
 
 type Config struct {
-	Listen       ListenConfig      `yaml:"listen" json:"listen"`
-	BootstrapDNS []string          `yaml:"bootstrap_dns" json:"bootstrap_dns"`
-	Upstreams    UpstreamsConfig   `yaml:"upstreams" json:"upstreams"`
-	Hosts        map[string]string `yaml:"-" json:"-"`
-	Rules        map[string]string `yaml:"-" json:"-"`
-	GeoData      GeoDataConfig     `yaml:"geo_data" json:"geo_data"`
-	AutoCert     AutoCertConfig    `yaml:"auto_cert" json:"auto_cert"`
-	WebUI        WebUIConfig       `yaml:"web_ui" json:"web_ui"`
-	QueryLog     QueryLogConfig    `yaml:"query_log" json:"query_log"`
+	Listen          ListenConfig      `yaml:"listen" json:"listen"`
+	BootstrapDNS    []string          `yaml:"bootstrap_dns" json:"bootstrap_dns"`
+	Upstreams       UpstreamsConfig   `yaml:"upstreams" json:"upstreams"`
+	Hosts           map[string]string `yaml:"-" json:"-"`
+	Rules           map[string]string `yaml:"-" json:"-"`
+	GeoData         GeoDataConfig     `yaml:"geo_data" json:"geo_data"`
+	AutoCert        AutoCertConfig    `yaml:"auto_cert" json:"auto_cert"`
+	TLSCertificates []TLSCertConfig   `yaml:"tls_certificates" json:"tls_certificates"`
+	WebUI           WebUIConfig       `yaml:"web_ui" json:"web_ui"`
+	QueryLog        QueryLogConfig    `yaml:"query_log" json:"query_log"`
+}
+
+type TLSCertConfig struct {
+	CertFile string `yaml:"cert_file" json:"cert_file"`
+	KeyFile  string `yaml:"key_file" json:"key_file"`
 }
 
 type QueryLogConfig struct {
@@ -46,11 +52,12 @@ type AutoCertConfig struct {
 }
 
 type ListenConfig struct {
-	DNSUDP string `yaml:"dns_udp" json:"dns_udp"`
-	DNSTCP string `yaml:"dns_tcp" json:"dns_tcp"`
-	DOH    string `yaml:"doh" json:"doh"`
-	DOT    string `yaml:"dot" json:"dot"`
-	DOQ    string `yaml:"doq" json:"doq"`
+	DNSUDP  string `yaml:"dns_udp" json:"dns_udp"`
+	DNSTCP  string `yaml:"dns_tcp" json:"dns_tcp"`
+	DOH     string `yaml:"doh" json:"doh"`
+	DoHPath string `yaml:"doh_path" json:"doh_path"`
+	DOT     string `yaml:"dot" json:"dot"`
+	DOQ     string `yaml:"doq" json:"doq"`
 }
 
 type UpstreamsConfig struct {

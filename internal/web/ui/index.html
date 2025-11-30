@@ -256,15 +256,15 @@
                 <button v-if="authEnabled && !isLoggedIn" @click="openLogin" class="btn-glass btn-glass-primary px-4 py-2 rounded-lg shadow-lg text-sm font-medium flex items-center">
                     <i class="fa-solid fa-right-to-bracket mr-2 md:mr-0"></i> <span class="hidden md:inline ml-2">{{ t('login') }}</span>
                 </button>
-                <button v-if="authEnabled && isLoggedIn" @click="doLogout" class="btn-glass bg-white/50 dark:bg-slate-800/50 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg text-sm font-medium flex items-center hover:bg-white/80 dark:hover:bg-slate-700/80">
-                    <i class="fa-solid fa-right-from-bracket mr-2 md:mr-0"></i> <span class="hidden md:inline">{{ t('logout') }}</span>
+                <button v-if="authEnabled && isLoggedIn" @click="doLogout" class="btn-glass btn-glass-secondary px-4 py-2 rounded-lg text-sm font-medium flex items-center">
+                    <i class="fa-solid fa-right-from-bracket mr-2 md:mr-0"></i> <span class="hidden md:inline ml-2">{{ t('logout') }}</span>
                 </button>
 
                 <button v-if="currentView === 'settings' && (!authEnabled || isLoggedIn)" @click="saveConfig" :disabled="loading" class="btn-glass btn-glass-primary px-4 py-2 rounded-lg shadow-lg text-sm font-medium flex items-center disabled:opacity-50">
-                    <i class="fa-solid fa-save mr-2 md:mr-0"></i> <span class="hidden md:inline">{{ loading ? t('saving') : t('save_apply') }}</span>
+                    <i class="fa-solid fa-save mr-2 md:mr-0"></i> <span class="hidden md:inline ml-2">{{ loading ? t('saving') : t('save_apply') }}</span>
                 </button>
                 
-                <button v-if="currentView === 'logs'" @click="fetchLogs(1)" class="btn-glass bg-white/50 dark:bg-slate-800/50 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg text-sm font-medium flex items-center hover:bg-white/80 dark:hover:bg-slate-700/80">
+                <button v-if="currentView === 'logs'" @click="fetchLogs(1)" class="btn-glass btn-glass-secondary px-4 py-2 rounded-lg text-sm font-medium flex items-center">
                     <i class="fa-solid fa-rotate mr-2"></i> <span class="hidden md:inline">{{ t('refresh') }}</span>
                 </button>
             </div>
@@ -565,6 +565,7 @@
                         <form-input :label="t('dns_udp')" v-model="config.listen.dns_udp" placeholder="53" :disabled="!canEdit"></form-input>
                         <form-input :label="t('dns_tcp')" v-model="config.listen.dns_tcp" placeholder="53" :disabled="!canEdit"></form-input>
                         <form-input :label="t('doh_https')" v-model="config.listen.doh" placeholder="443" :disabled="!canEdit"></form-input>
+                        <form-input :label="t('doh_path')" v-model="config.listen.doh_path" placeholder="/dns-query" :disabled="!canEdit"></form-input>
                         <form-input :label="t('dot_tls')" v-model="config.listen.dot" placeholder="853" :disabled="!canEdit"></form-input>
                         <form-input :label="t('doq_quic')" v-model="config.listen.doq" placeholder="853" :disabled="!canEdit"></form-input>
                     </div>
@@ -583,6 +584,23 @@
                             <button v-if="canEdit" @click="removeBootstrap(index)" class="ml-3 text-red-400 hover:text-red-600 w-8 h-8 flex items-center justify-center rounded-full hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"><i class="fa-solid fa-times"></i></button>
                         </div>
                         <button v-if="canEdit" @click="addBootstrap" class="mt-2 flex items-center text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 font-medium px-3 py-2 rounded hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"><i class="fa-solid fa-plus mr-1"></i> {{ t('add') }}</button>
+                    </div>
+                </div>
+
+                <div class="glass-card rounded-2xl overflow-hidden">
+                    <div class="bg-slate-50/80 dark:bg-slate-900/80 px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center">
+                        <i class="fa-solid fa-key text-slate-400 mr-3"></i>
+                        <h3 class="text-lg font-medium text-slate-900 dark:text-slate-100">{{ t('setting_tls_certs') }}</h3>
+                    </div>
+                    <div class="p-6 bg-white dark:bg-slate-950">
+                        <div v-for="(cert, index) in config.tls_certificates" :key="index" class="flex mb-3 items-start bg-slate-50 dark:bg-slate-900 p-4 rounded-lg border border-slate-200 dark:border-slate-800">
+                            <div class="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <form-input :label="t('cert_file')" v-model="cert.cert_file" placeholder="certs/example.com.crt" :disabled="!canEdit"></form-input>
+                                <form-input :label="t('key_file')" v-model="cert.key_file" placeholder="certs/example.com.key" :disabled="!canEdit"></form-input>
+                            </div>
+                            <button v-if="canEdit" @click="removeTLSCert(index)" class="ml-3 mt-6 text-red-400 hover:text-red-600 w-8 h-8 flex items-center justify-center rounded-full hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"><i class="fa-solid fa-trash-can"></i></button>
+                        </div>
+                        <button v-if="canEdit" @click="addTLSCert" class="mt-2 flex items-center text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 font-medium px-3 py-2 rounded hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"><i class="fa-solid fa-plus mr-1"></i> {{ t('add') }}</button>
                     </div>
                 </div>
 
@@ -797,6 +815,7 @@ const i18nData = {
         setting_listen: "服务监听端口 (仅需填写端口号)",
         setting_bootstrap: "Bootstrap DNS (引导)",
         setting_upstreams: "上游 DNS 服务器",
+        setting_tls_certs: "TLS 证书配置 (多证书)",
         setting_log_size: "日志文件最大大小 (MB)",
         setting_save_file: "开启持久化存储 (保存到文件)",
         setting_log_path: "日志文件路径",
@@ -818,9 +837,12 @@ const i18nData = {
         status: "状态",
         dns_udp: "DNS UDP",
         dns_tcp: "DNS TCP",
-        doh_https: "DoH",
+        doh_https: "DoH Port",
+        doh_path: "DoH Path",
         dot_tls: "DoT",
         doq_quic: "DoQ",
+        cert_file: "证书文件路径 (.crt)",
+        key_file: "私钥文件路径 (.key)",
         table_server: "服务器",
         table_group: "分组",
         table_queries: "查询数",
@@ -872,6 +894,7 @@ const i18nData = {
         setting_listen: "Listening Ports (Port only)",
         setting_bootstrap: "Bootstrap DNS",
         setting_upstreams: "Upstream Servers",
+        setting_tls_certs: "TLS Certificates",
         setting_log_size: "Log File Max Size (MB)",
         setting_save_file: "Save to File (Persistent)",
         setting_log_path: "Log File Path",
@@ -893,9 +916,12 @@ const i18nData = {
         status: "Status",
         dns_udp: "DNS UDP",
         dns_tcp: "DNS TCP",
-        doh_https: "DoH",
+        doh_https: "DoH Port",
+        doh_path: "DoH Path",
         dot_tls: "DoT",
         doq_quic: "DoQ",
+        cert_file: "Cert File (.crt)",
+        key_file: "Key File (.key)",
         table_server: "Server",
         table_group: "Group",
         table_queries: "Queries",
@@ -994,6 +1020,7 @@ const app = Vue.createApp({
             config: {
                 listen: {},
                 bootstrap_dns: [],
+                tls_certificates: [],
                 upstreams: { cn: [], overseas: [] },
                 geo_data: {},
                 auto_cert: { domains: [] },
@@ -1173,6 +1200,7 @@ const app = Vue.createApp({
                 if(!res.ok) throw new Error("Failed to load");
                 this.config = await res.json();
                 if(!this.config.bootstrap_dns) this.config.bootstrap_dns = [];
+                if(!this.config.tls_certificates) this.config.tls_certificates = [];
                 if(!this.config.upstreams.cn) this.config.upstreams.cn = [];
                 if(!this.config.upstreams.overseas) this.config.upstreams.overseas = [];
                 if(!this.config.query_log) this.config.query_log = { enabled: true, max_history: 5000, save_to_file: false, file: "" };
@@ -1271,6 +1299,8 @@ const app = Vue.createApp({
         },
         addBootstrap() { this.config.bootstrap_dns.push(""); },
         removeBootstrap(idx) { this.config.bootstrap_dns.splice(idx, 1); },
+        addTLSCert() { this.config.tls_certificates.push({ cert_file: "", key_file: "" }); },
+        removeTLSCert(idx) { this.config.tls_certificates.splice(idx, 1); },
         addUpstream(type) {
             const empty = { address: "", protocol: "udp", ecs_ip: "", pipeline: false, http3: false, insecure_skip_verify: false, _id: Date.now() };
             if(type === 'cn') this.config.upstreams.cn.push(empty);

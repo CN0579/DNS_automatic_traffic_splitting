@@ -6,11 +6,12 @@ listen:
   dns_udp: "53"
   dns_tcp: "53"
   doh: "443"
+  doh_path: "/dns-query" # 自定义 DoH 路径，默认为 /dns-query
   dot: "853"
   doq: "853"
 
 # 自动证书申请 (Let's Encrypt)
-# 如果启用，server.crt 和 server.key 将被忽略，证书将自动管理。
+# 如果启用，tls_certificates 和 server.crt/server.key 将被忽略，证书将自动管理。
 # 注意：需要公网 80 和 443 端口可访问。
 auto_cert:
   enabled: false
@@ -18,6 +19,18 @@ auto_cert:
   domains:
     - "dns.example.com"
   cert_dir: "certs" # 证书缓存目录
+
+# 手动证书配置 (多证书支持)
+# 当 auto_cert 为 false 时生效。
+# 可以配置多个证书，例如分别用于域名和IP。
+# 如果此项留空，将尝试加载默认的 server.crt 和 server.key。
+tls_certificates:
+  # 示例：域名证书
+  - cert_file: "certs/example.com.crt"
+    key_file: "certs/example.com.key"
+  # 示例：IP证书
+  - cert_file: "certs/192.168.1.100.crt"
+    key_file: "certs/192.168.1.100.key"
 
 # Bootstrap DNS (用于解析上游服务器域名)
 bootstrap_dns:

@@ -19,6 +19,7 @@ import (
 	"github.com/miekg/dns"
 )
 
+//go:embed ui
 var uiFS embed.FS
 
 var (
