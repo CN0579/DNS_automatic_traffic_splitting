@@ -38,6 +38,16 @@ func NewGeoDataManager(geoipPath, geositePath string) (*GeoDataManager, error) {
 	}, nil
 }
 
+func VerifyGeoIP(path string) error {
+	_, err := geoip.FromFile(path)
+	return err
+}
+
+func VerifyGeoSite(path string) error {
+	_, err := geosite.FromFile(path)
+	return err
+}
+
 func (g *GeoDataManager) IsCNIP(ip net.IP) bool {
 	if g.geoip == nil {
 		return false

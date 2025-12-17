@@ -7,7 +7,9 @@ import (
 	"os"
 )
 
-func DownloadFile(filepath string, url string) error {
+type Validator func(string) error
+
+func DownloadFile(filepath string, url string, validator Validator) error {
 	tempFile := filepath + ".tmp"
 
 	out, err := os.Create(tempFile)
@@ -38,9 +40,15 @@ func DownloadFile(filepath string, url string) error {
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
 
-	success = true
-
 	out.Close()
+
+	if validator != nil {
+		if err := validator(tempFile); err != nil {
+			return fmt.Errorf("文件校验失败: %w", err)
+		}
+	}
+
+	success = true
 
 	if err := os.Rename(tempFile, filepath); err != nil {
 		return fmt.Errorf("重命名文件失败: %w", err)

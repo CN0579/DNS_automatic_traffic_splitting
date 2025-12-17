@@ -122,7 +122,7 @@ func (m *ServiceManager) CheckAndDownloadGeoFiles() {
 	if shouldDownload(cfg.GeoData.GeoIPDat) {
 		if cfg.GeoData.GeoIPDownloadURL != "" {
 			log.Printf("GeoIP 文件 %s 不存在或为空，正在从 %s 下载...", cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL)
-			if err := util.DownloadFile(cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL); err != nil {
+			if err := util.DownloadFile(cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL, router.VerifyGeoIP); err != nil {
 				log.Printf("错误: 下载 GeoIP 文件失败: %v", err)
 			} else {
 				log.Println("GeoIP 文件下载成功")
@@ -133,7 +133,7 @@ func (m *ServiceManager) CheckAndDownloadGeoFiles() {
 	if shouldDownload(cfg.GeoData.GeoSiteDat) {
 		if cfg.GeoData.GeoSiteDownloadURL != "" {
 			log.Printf("GeoSite 文件 %s 不存在或为空，正在从 %s 下载...", cfg.GeoData.GeoSiteDat, cfg.GeoData.GeoSiteDownloadURL)
-			if err := util.DownloadFile(cfg.GeoData.GeoSiteDat, cfg.GeoData.GeoSiteDownloadURL); err != nil {
+			if err := util.DownloadFile(cfg.GeoData.GeoSiteDat, cfg.GeoData.GeoSiteDownloadURL, router.VerifyGeoSite); err != nil {
 				log.Printf("错误: 下载 GeoSite 文件失败: %v", err)
 			} else {
 				log.Println("GeoSite 文件下载成功")
@@ -146,13 +146,13 @@ func (m *ServiceManager) ForceDownloadGeoFiles() {
 	cfg := m.Config
 	if cfg.GeoData.GeoIPDownloadURL != "" {
 		log.Printf("正在自动更新 GeoIP 数据...")
-		if err := util.DownloadFile(cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL); err != nil {
+		if err := util.DownloadFile(cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL, router.VerifyGeoIP); err != nil {
 			log.Printf("更新 GeoIP 失败: %v", err)
 		}
 	}
 	if cfg.GeoData.GeoSiteDownloadURL != "" {
 		log.Printf("正在自动更新 GeoSite 数据...")
-		if err := util.DownloadFile(cfg.GeoData.GeoSiteDat, cfg.GeoData.GeoSiteDownloadURL); err != nil {
+		if err := util.DownloadFile(cfg.GeoData.GeoSiteDat, cfg.GeoData.GeoSiteDownloadURL, router.VerifyGeoSite); err != nil {
 			log.Printf("更新 GeoSite 失败: %v", err)
 		}
 	}
