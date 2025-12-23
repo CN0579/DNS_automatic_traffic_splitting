@@ -2,9 +2,12 @@ package querylog
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +44,7 @@ type Stats struct {
 
 type QueryLogger struct {
 	mu         sync.RWMutex
+	fileMu     sync.Mutex
 	logs       []*LogEntry
 	maxSizeMB  int
 	nextID     int64
@@ -134,13 +138,26 @@ func (l *QueryLogger) addToMemory(entry *LogEntry) {
 }
 
 func (l *QueryLogger) appendToFile(entry LogEntry) {
-	fi, err := os.Stat(l.filePath)
-	if err == nil && fi.Size() >= int64(l.maxSizeMB)*1024*1024 {
-		os.Rename(l.filePath, l.filePath+".old")
-	}
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
 
 	data, err := json.Marshal(entry)
 	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+
+	limitBytes := int64(l.maxSizeMB) * 1024 * 1024
+
+	fi, err := os.Stat(l.filePath)
+	if err == nil {
+		if fi.Size()+int64(len(data)) > limitBytes {
+			if err := l.pruneLogFile(limitBytes); err != nil {
+				log.Printf("Error pruning log file: %v", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("Error checking log file size: %v", err)
 		return
 	}
 
@@ -153,9 +170,74 @@ func (l *QueryLogger) appendToFile(entry LogEntry) {
 
 	if _, err := f.Write(data); err != nil {
 		log.Printf("Error writing data to log file: %v", err)
-		return
 	}
-	f.WriteString("\n")
+}
+
+func (l *QueryLogger) pruneLogFile(limitBytes int64) (err error) {
+	targetSize := int64(float64(limitBytes) * 0.8)
+
+	f, err := os.Open(l.filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fi.Size()
+
+	if fileSize <= targetSize {
+		return nil
+	}
+
+	startPos := fileSize - targetSize
+	dir := filepath.Dir(l.filePath)
+	tmpFile, err := os.CreateTemp(dir, "querylog_*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+
+	defer func() {
+		if tmpFile != nil {
+			tmpFile.Close()
+		}
+		if err != nil {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if _, err = f.Seek(startPos, 0); err != nil {
+		return err
+	}
+
+	buf := make([]byte, 1024)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	copyStart := startPos
+	newlineIdx := bytes.IndexByte(buf[:n], '\n')
+	if newlineIdx != -1 {
+		copyStart = startPos + int64(newlineIdx) + 1
+	}
+
+	if _, err = f.Seek(copyStart, 0); err != nil {
+		return err
+	}
+
+	if _, err = io.Copy(tmpFile, f); err != nil {
+		return err
+	}
+
+	f.Close()
+	tmpFile.Close()
+	tmpFile = nil
+
+	return os.Rename(tmpName, l.filePath)
 }
 
 func (l *QueryLogger) GetLogs(offset, limit int, search string) ([]*LogEntry, int64) {
@@ -197,6 +279,9 @@ func (l *QueryLogger) GetLogs(offset, limit int, search string) ([]*LogEntry, in
 }
 
 func (l *QueryLogger) readLogsFromFileBackwards(offset, limit int, search string) ([]*LogEntry, int64, error) {
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
+
 	file, err := os.Open(l.filePath)
 	if err != nil {
 		return nil, 0, err
