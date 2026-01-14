@@ -156,6 +156,18 @@ func (r *Router) Route(ctx context.Context, req *dns.Msg, clientIP string) (*dns
 		})
 	}
 
+	if resp != nil && resp.Rcode == dns.RcodeNameError {
+		for _, ans := range resp.Answer {
+			ans.Header().Ttl = 0
+		}
+		for _, ns := range resp.Ns {
+			ns.Header().Ttl = 0
+		}
+		for _, extra := range resp.Extra {
+			extra.Header().Ttl = 0
+		}
+	}
+
 	return resp, err
 }
 
