@@ -235,7 +235,9 @@ func (r *Router) routeInternal(ctx context.Context, req *dns.Msg) (*dns.Msg, str
 
 	resp, err := client.RaceResolve(ctx, req, r.overseasClients)
 	if err != nil {
-		return nil, "GeoIP(Fail)", fmt.Errorf("GeoIP分流时首次海外解析失败: %w", err)
+		log.Printf("海外DNS解析失败，fallback到国内DNS: %s, 原因: %v", qName, err)
+		resp, err := client.RaceResolve(ctx, req, r.cnClients)
+		return resp, "GeoIP(Fallback/CN)", err
 	}
 
 	var resolvedIP net.IP
