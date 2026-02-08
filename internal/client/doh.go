@@ -47,6 +47,27 @@ func (c *DoHClient) initHTTPClient() {
 				QUICConfig: &quic.Config{
 					MaxIdleTimeout: 30 * time.Second,
 				},
+				Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+					host, port, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, err
+					}
+					ip, err := c.bootstrapper.LookupIP(ctx, host)
+					if err != nil {
+						return nil, fmt.Errorf("H3 bootstrap解析失败: %w", err)
+					}
+					resolvedAddr := net.JoinHostPort(ip, port)
+					udpAddr, err := net.ResolveUDPAddr("udp", resolvedAddr)
+					if err != nil {
+						return nil, err
+					}
+					udpConn, err := net.ListenUDP("udp", nil)
+					if err != nil {
+						return nil, err
+					}
+					tr := &quic.Transport{Conn: udpConn}
+					return tr.Dial(ctx, udpAddr, tlsCfg, cfg)
+				},
 			},
 			Timeout: 10 * time.Second,
 		}

@@ -233,29 +233,78 @@ func (r *Router) routeInternal(ctx context.Context, req *dns.Msg) (*dns.Msg, str
 		}
 	}
 
-	resp, err := client.RaceResolve(ctx, req, r.overseasClients)
-	if err != nil {
-		log.Printf("海外DNS解析失败，fallback到国内DNS: %s, 原因: %v", qName, err)
-		resp, err := client.RaceResolve(ctx, req, r.cnClients)
-		return resp, "GeoIP(Fallback/CN)", err
+	// GeoSite 未命中：同时查询国内和海外 DNS，根据结果判断
+	type dualResult struct {
+		resp     *dns.Msg
+		err      error
+		source   string
 	}
 
-	var resolvedIP net.IP
-	for _, ans := range resp.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			resolvedIP = a.A
-			break
+	dualCh := make(chan dualResult, 2)
+
+	go func() {
+		resp, err := client.RaceResolve(ctx, req.Copy(), r.overseasClients)
+		dualCh <- dualResult{resp: resp, err: err, source: "overseas"}
+	}()
+	go func() {
+		resp, err := client.RaceResolve(ctx, req.Copy(), r.cnClients)
+		dualCh <- dualResult{resp: resp, err: err, source: "cn"}
+	}()
+
+	var overseasResult, cnResult *dualResult
+	for i := 0; i < 2; i++ {
+		r := <-dualCh
+		rCopy := r
+		if r.source == "overseas" {
+			overseasResult = &rCopy
+		} else {
+			cnResult = &rCopy
 		}
-		if aaaa, ok := ans.(*dns.AAAA); ok {
-			resolvedIP = aaaa.AAAA
-			break
+	}
+
+	// 海外成功且有应答
+	if overseasResult.err == nil && overseasResult.resp != nil && overseasResult.resp.Rcode == dns.RcodeSuccess {
+		var resolvedIP net.IP
+		for _, ans := range overseasResult.resp.Answer {
+			if a, ok := ans.(*dns.A); ok {
+				resolvedIP = a.A
+				break
+			}
+			if aaaa, ok := ans.(*dns.AAAA); ok {
+				resolvedIP = aaaa.AAAA
+				break
+			}
 		}
+
+		// 如果解析出的 IP 是国内的，用国内 DNS 的结果（更准确）
+		if resolvedIP != nil && r.geo.IsCNIP(resolvedIP) {
+			if cnResult.err == nil && cnResult.resp != nil && cnResult.resp.Rcode == dns.RcodeSuccess {
+				return cnResult.resp, "GeoIP(CN)", nil
+			}
+			// 国内 DNS 失败，仍然返回海外结果
+			return overseasResult.resp, "GeoIP(CN/Fallback-Overseas)", nil
+		}
+
+		return overseasResult.resp, "GeoIP(Overseas)", nil
 	}
 
-	if resolvedIP != nil && r.geo.IsCNIP(resolvedIP) {
-		resp, err := client.RaceResolve(ctx, req, r.cnClients)
-		return resp, "GeoIP(CN)", err
+	// 海外失败或 NXDOMAIN/SERVFAIL，尝试用国内结果
+	if cnResult.err == nil && cnResult.resp != nil && cnResult.resp.Rcode == dns.RcodeSuccess {
+		log.Printf("海外DNS解析失败或无结果，使用国内DNS结果: %s", qName)
+		return cnResult.resp, "GeoIP(Fallback/CN)", nil
 	}
 
-	return resp, "GeoIP(Overseas)", nil
+	// 两边都失败，返回最有意义的错误
+	if overseasResult.err == nil && overseasResult.resp != nil {
+		return overseasResult.resp, "GeoIP(Overseas)", nil
+	}
+	if cnResult.err == nil && cnResult.resp != nil {
+		return cnResult.resp, "GeoIP(CN)", nil
+	}
+
+	// 全部出错
+	if overseasResult.err != nil {
+		return nil, "GeoIP(Error)", fmt.Errorf("所有DNS查询均失败: overseas=%v, cn=%v", overseasResult.err, cnResult.err)
+	}
+	return nil, "GeoIP(Error)", cnResult.err
 }
