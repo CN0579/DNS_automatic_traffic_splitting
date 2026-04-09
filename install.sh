@@ -142,6 +142,7 @@ write_example_config() {
 # Example configuration for doh-autoproxy.
 
 listen:
+  address: "" # default: 0.0.0.0
   dns_udp: "53"
   dns_tcp: "53"
   doh: "443"

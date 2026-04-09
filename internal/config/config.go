@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,12 +56,33 @@ type AutoCertConfig struct {
 }
 
 type ListenConfig struct {
+	Address string `yaml:"address" json:"address"`
 	DNSUDP  string `yaml:"dns_udp" json:"dns_udp"`
 	DNSTCP  string `yaml:"dns_tcp" json:"dns_tcp"`
 	DOH     string `yaml:"doh" json:"doh"`
 	DoHPath string `yaml:"doh_path" json:"doh_path"`
 	DOT     string `yaml:"dot" json:"dot"`
 	DOQ     string `yaml:"doq" json:"doq"`
+}
+
+func (l ListenConfig) DNSUDPAddr() string {
+	return resolveListenAddr(l.Address, l.DNSUDP)
+}
+
+func (l ListenConfig) DNSTCPAddr() string {
+	return resolveListenAddr(l.Address, l.DNSTCP)
+}
+
+func (l ListenConfig) DOHAddr() string {
+	return resolveListenAddr(l.Address, l.DOH)
+}
+
+func (l ListenConfig) DOTAddr() string {
+	return resolveListenAddr(l.Address, l.DOT)
+}
+
+func (l ListenConfig) DOQAddr() string {
+	return resolveListenAddr(l.Address, l.DOQ)
 }
 
 type UpstreamsConfig struct {
@@ -106,16 +128,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	cfg.ConfigDir = configDir
 	cfg.QueryLog.Enabled = true
 
-	normalizePort := func(p *string) {
-		if *p != "" && !strings.Contains(*p, ":") {
-			*p = ":" + *p
-		}
-	}
-	normalizePort(&cfg.Listen.DNSUDP)
-	normalizePort(&cfg.Listen.DNSTCP)
-	normalizePort(&cfg.Listen.DOH)
-	normalizePort(&cfg.Listen.DOT)
-	normalizePort(&cfg.Listen.DOQ)
+	normalizeListenConfig(&cfg.Listen)
 
 	cfg.Hosts = make(map[string]string)
 	cfg.Rules = make(map[string]string)
@@ -165,16 +178,7 @@ func (c *Config) Save(configPath string) error {
 	configDir := filepath.Dir(absPath)
 	c.ConfigDir = configDir
 
-	normalizePort := func(p *string) {
-		if *p != "" && !strings.Contains(*p, ":") {
-			*p = ":" + *p
-		}
-	}
-	normalizePort(&c.Listen.DNSUDP)
-	normalizePort(&c.Listen.DNSTCP)
-	normalizePort(&c.Listen.DOH)
-	normalizePort(&c.Listen.DOT)
-	normalizePort(&c.Listen.DOQ)
+	normalizeListenConfig(&c.Listen)
 
 	relPath := func(p string) string {
 		if strings.HasPrefix(p, configDir) {
@@ -308,4 +312,74 @@ func GetDefaultConfigPath() string {
 	}
 
 	return "config.yaml"
+}
+
+func normalizeListenConfig(listen *ListenConfig) {
+	if listen == nil {
+		return
+	}
+
+	listen.Address = strings.TrimSpace(listen.Address)
+	inferredAddress := ""
+
+	normalizePort := func(p *string) {
+		host, port := splitListenValue(*p)
+		if port != "" {
+			*p = port
+		} else {
+			*p = strings.TrimSpace(*p)
+		}
+		if listen.Address == "" && inferredAddress == "" && host != "" {
+			inferredAddress = host
+		}
+	}
+
+	normalizePort(&listen.DNSUDP)
+	normalizePort(&listen.DNSTCP)
+	normalizePort(&listen.DOH)
+	normalizePort(&listen.DOT)
+	normalizePort(&listen.DOQ)
+
+	if listen.Address == "" {
+		listen.Address = inferredAddress
+	}
+}
+
+func splitListenValue(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(value, ":") {
+		return "", strings.TrimSpace(strings.TrimPrefix(value, ":"))
+	}
+	if !strings.Contains(value, ":") {
+		return "", value
+	}
+
+	host, port, err := net.SplitHostPort(value)
+	if err == nil {
+		return strings.TrimSpace(host), strings.TrimSpace(port)
+	}
+
+	if strings.Count(value, ":") == 1 {
+		parts := strings.SplitN(value, ":", 2)
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+
+	return "", value
+}
+
+func resolveListenAddr(address, value string) string {
+	_, port := splitListenValue(value)
+	if port == "" {
+		return ""
+	}
+
+	host := strings.TrimSpace(address)
+	if host == "" {
+		host = "0.0.0.0"
+	}
+
+	return net.JoinHostPort(host, port)
 }

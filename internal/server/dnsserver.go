@@ -24,12 +24,12 @@ func NewDNSServer(cfg *config.Config, r *router.Router) *DNSServer {
 
 	var udpServer, tcpServer *dns.Server
 
-	if cfg.Listen.DNSUDP != "" {
-		udpServer = &dns.Server{Addr: cfg.Listen.DNSUDP, Net: "udp", Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	if addr := cfg.Listen.DNSUDPAddr(); addr != "" {
+		udpServer = &dns.Server{Addr: addr, Net: "udp", Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	}
 
-	if cfg.Listen.DNSTCP != "" {
-		tcpServer = &dns.Server{Addr: cfg.Listen.DNSTCP, Net: "tcp", Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	if addr := cfg.Listen.DNSTCPAddr(); addr != "" {
+		tcpServer = &dns.Server{Addr: addr, Net: "tcp", Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	}
 
 	return &DNSServer{

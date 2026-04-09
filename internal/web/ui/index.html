@@ -613,6 +613,10 @@
                         <h3 class="text-lg font-medium text-slate-900 dark:text-slate-100">{{ t('setting_listen') }}</h3>
                     </div>
                     <div class="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 bg-white dark:bg-slate-950">
+                        <div class="md:col-span-2 lg:col-span-3">
+                            <form-input :label="t('listen_address')" v-model="config.listen.address" placeholder="0.0.0.0" :disabled="!canEdit"></form-input>
+                            <p class="text-xs text-slate-500 mt-1 ml-1">{{ t('listen_address_help') }}</p>
+                        </div>
                         <form-input :label="t('dns_udp')" v-model="config.listen.dns_udp" placeholder="53" :disabled="!canEdit"></form-input>
                         <form-input :label="t('dns_tcp')" v-model="config.listen.dns_tcp" placeholder="53" :disabled="!canEdit"></form-input>
                         <form-input :label="t('doh_https')" v-model="config.listen.doh" placeholder="443" :disabled="!canEdit"></form-input>
@@ -1059,7 +1063,7 @@ const i18nData = {
         log_duration: "耗时",
         no_logs: "暂无查询日志",
         setting_querylog: "日志记录设置",
-        setting_listen: "服务监听端口",
+        setting_listen: "服务监听",
         setting_bootstrap: "Bootstrap DNS",
         setting_upstreams: "上游 DNS 服务器",
         setting_hosts: "自定义 Hosts",
@@ -1090,6 +1094,8 @@ const i18nData = {
         ok: "确定",
         latency: "延迟",
         status: "状态",
+        listen_address: "监听地址",
+        listen_address_help: "留空时默认监听 0.0.0.0。",
         dns_udp: "DNS UDP",
         dns_tcp: "DNS TCP",
         doh_https: "DoH Port",
@@ -1164,7 +1170,7 @@ const i18nData = {
         log_duration: "Duration",
         no_logs: "No logs found",
         setting_querylog: "Query Log",
-        setting_listen: "Listening Ports",
+        setting_listen: "Listening",
         setting_bootstrap: "Bootstrap DNS",
         setting_upstreams: "Upstream Servers",
         setting_hosts: "Custom Hosts",
@@ -1195,6 +1201,8 @@ const i18nData = {
         ok: "OK",
         latency: "Latency",
         status: "Status",
+        listen_address: "Listen Address",
+        listen_address_help: "Defaults to 0.0.0.0 when left empty.",
         dns_udp: "DNS UDP",
         dns_tcp: "DNS TCP",
         doh_https: "DoH Port",
@@ -1326,7 +1334,7 @@ const app = Vue.createApp({
             newHost: { domain: "", ip: "" },
             rulesArray: [],
             config: {
-                listen: {},
+                listen: { address: "" },
                 bootstrap_dns: [],
                 tls_certificates: [],
                 upstreams: { cn: [], overseas: [] },
@@ -1432,7 +1440,7 @@ const app = Vue.createApp({
             return s;
         },
         formatListenPort(portValue) {
-            return portValue && portValue.startsWith(':') ? portValue.substring(1) : portValue;
+            return portValue || "";
         },
         getStartTime(uptime) {
             if (!uptime) return '-';
@@ -1573,6 +1581,8 @@ const app = Vue.createApp({
                 if(!this.config.hosts) this.config.hosts = {};
                 if(!this.config.rules) this.config.rules = {};
                 if(!this.config.geo_data) this.config.geo_data = {};
+                if(!this.config.listen) this.config.listen = { address: "" };
+                if(this.config.listen.address === undefined || this.config.listen.address === null) this.config.listen.address = "";
 
                 this.fetchHosts(1);
                 this.rulesArray = Object.entries(this.config.rules).map(([d, t]) => ({domain: d, target: t}));
@@ -1581,15 +1591,6 @@ const app = Vue.createApp({
                 const addId = (s) => { if(!s._id) s._id = Date.now() + (idCounter++); return s; };
                 this.config.upstreams.cn.forEach(addId);
                 this.config.upstreams.overseas.forEach(addId);
-
-                const strip = (p) => p ? p.toString().replace(':', '') : '';
-                if(this.config.listen) {
-                    this.config.listen.dns_udp = strip(this.config.listen.dns_udp);
-                    this.config.listen.dns_tcp = strip(this.config.listen.dns_tcp);
-                    this.config.listen.doh = strip(this.config.listen.doh);
-                    this.config.listen.dot = strip(this.config.listen.dot);
-                    this.config.listen.doq = strip(this.config.listen.doq);
-                }
             } catch(e) {
                 console.error(e);
             }
@@ -1602,6 +1603,16 @@ const app = Vue.createApp({
                 const cleanConfig = JSON.parse(JSON.stringify(this.config));
                 if(cleanConfig.upstreams.cn) cleanConfig.upstreams.cn.forEach(s => delete s._id);
                 if(cleanConfig.upstreams.overseas) cleanConfig.upstreams.overseas.forEach(s => delete s._id);
+                if(cleanConfig.listen) {
+                    const trim = (value) => value == null ? "" : value.toString().trim();
+                    cleanConfig.listen.address = trim(cleanConfig.listen.address);
+                    cleanConfig.listen.dns_udp = trim(cleanConfig.listen.dns_udp);
+                    cleanConfig.listen.dns_tcp = trim(cleanConfig.listen.dns_tcp);
+                    cleanConfig.listen.doh = trim(cleanConfig.listen.doh);
+                    cleanConfig.listen.doh_path = trim(cleanConfig.listen.doh_path);
+                    cleanConfig.listen.dot = trim(cleanConfig.listen.dot);
+                    cleanConfig.listen.doq = trim(cleanConfig.listen.doq);
+                }
 
                 cleanConfig.hosts = {};
                 cleanConfig.rules = this.rulesArray.reduce((acc, cur) => { if(cur.domain) acc[cur.domain] = cur.target; return acc; }, {});

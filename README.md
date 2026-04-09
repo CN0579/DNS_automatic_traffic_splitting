@@ -105,6 +105,7 @@ chmod +x doh-autoproxy-linux-amd64
 #  服务监听
 # ═══════════════════════════════════════════════════════
 listen:
+  address: ""             # 监听地址，留空默认 0.0.0.0
   dns_udp: "53"           # 标准 DNS (UDP)
   dns_tcp: "53"           # 标准 DNS (TCP)
   doh: "443"              # DNS over HTTPS

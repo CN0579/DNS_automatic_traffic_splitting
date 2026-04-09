@@ -28,7 +28,7 @@ type DoQServer struct {
 
 func NewDoQServer(cfg *config.Config, r *router.Router, cm *util.CertManager) *DoQServer {
 	return &DoQServer{
-		addr:   cfg.Listen.DOQ,
+		addr:   cfg.Listen.DOQAddr(),
 		router: r,
 		cfg:    cfg,
 		cm:     cm,
