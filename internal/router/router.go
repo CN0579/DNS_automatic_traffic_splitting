@@ -85,6 +85,10 @@ func NewRouter(cfg *config.Config, geoManager *GeoDataManager, logger *querylog.
 }
 
 func (r *Router) GetUpstreamStats() []interface{} {
+	if r == nil {
+		return nil
+	}
+
 	var stats []interface{}
 	for _, s := range r.cnStats {
 		stats = append(stats, s.GetStats())
@@ -121,58 +125,57 @@ func (r *Router) Route(ctx context.Context, req *dns.Msg, clientIP string) (*dns
 		return nil, fmt.Errorf("no question")
 	}
 
-	downstreamECS := client.ExtractECS(req)
+	logging := r.logger.Enabled()
+
+	var downstreamECS string
+	if logging {
+		downstreamECS = client.ExtractECS(req)
+	}
+
 	resp, upstream, err := r.routeInternal(ctx, req)
 	if err == nil && resp != nil {
 		resp, upstream = r.normalizeServiceBindingNegativeResponse(ctx, req, resp, upstream)
 	}
-
-	duration := time.Since(start).Milliseconds()
-
-	qName := req.Question[0].Name
-	qType := dns.Type(req.Question[0].Qtype).String()
-
-	status := "ERROR"
-	answer := ""
-	var answerRecords []querylog.AnswerRecord
-
-	if err == nil && resp != nil {
-		status = dns.RcodeToString[resp.Rcode]
-		if len(resp.Answer) > 0 {
-			parts := strings.Fields(resp.Answer[0].String())
-			if len(parts) > 4 {
-				answer = strings.Join(parts[4:], " ")
-			} else {
-				answer = resp.Answer[0].String()
-			}
-			if len(resp.Answer) > 1 {
-				answer += fmt.Sprintf(" (+%d more)", len(resp.Answer)-1)
-			}
-
-			for _, ans := range resp.Answer {
-				parts := strings.Fields(ans.String())
-				data := ""
-				if len(parts) > 4 {
-					data = strings.Join(parts[4:], " ")
-				} else {
-					data = ans.String()
-				}
-				answerRecords = append(answerRecords, querylog.AnswerRecord{
-					Name: ans.Header().Name,
-					Type: dns.Type(ans.Header().Rrtype).String(),
-					TTL:  ans.Header().Ttl,
-					Data: data,
-				})
-			}
-		}
+	// 契约：绝不返回 (nil, nil)。所有调用方在 err==nil 时都会直接
+	// 解引用 resp（Truncate/Pack/WriteMsg），空指针会导致进程崩溃。
+	if err == nil && resp == nil {
+		err = fmt.Errorf("上游未返回响应")
 	}
 
-	if r.logger != nil {
+	// 日志内容的格式化对每条应答记录都要做字符串切分，代价不低；
+	// 未启用日志时完全跳过。
+	if logging {
+		duration := time.Since(start).Milliseconds()
+
+		status := "ERROR"
+		answer := ""
+		var answerRecords []querylog.AnswerRecord
+
+		if err == nil && resp != nil {
+			status = dns.RcodeToString[resp.Rcode]
+			if len(resp.Answer) > 0 {
+				answer = rrData(resp.Answer[0])
+				if len(resp.Answer) > 1 {
+					answer += fmt.Sprintf(" (+%d more)", len(resp.Answer)-1)
+				}
+
+				answerRecords = make([]querylog.AnswerRecord, 0, len(resp.Answer))
+				for _, ans := range resp.Answer {
+					answerRecords = append(answerRecords, querylog.AnswerRecord{
+						Name: ans.Header().Name,
+						Type: dns.Type(ans.Header().Rrtype).String(),
+						TTL:  ans.Header().Ttl,
+						Data: rrData(ans),
+					})
+				}
+			}
+		}
+
 		r.logger.AddLog(&querylog.LogEntry{
 			ClientIP:      clientIP,
 			DownstreamECS: downstreamECS,
-			Domain:        qName,
-			Type:          qType,
+			Domain:        req.Question[0].Name,
+			Type:          dns.Type(req.Question[0].Qtype).String(),
 			Upstream:      upstream,
 			Answer:        answer,
 			AnswerRecords: answerRecords,
@@ -189,11 +192,34 @@ func (r *Router) Route(ctx context.Context, req *dns.Msg, clientIP string) (*dns
 			ns.Header().Ttl = 0
 		}
 		for _, extra := range resp.Extra {
+			// OPT 记录的 TTL 字段并非存活时间，而是编码了扩展 RCODE、
+			// EDNS 版本与 DO 位（RFC 6891 §6.1.3）；清零会静默丢掉
+			// DNSSEC DO 标志和扩展 RCODE。
+			if extra.Header().Rrtype == dns.TypeOPT {
+				continue
+			}
 			extra.Header().Ttl = 0
 		}
 	}
 
 	return resp, err
+}
+
+// rrData 返回记录的 RDATA 部分，即去掉 "name ttl class type" 四个前导字段后的内容。
+func rrData(rr dns.RR) string {
+	s := rr.String()
+	// 前导字段之后是 RDATA；只切分前 4 个字段，避免对整条记录做切分。
+	for i := 0; i < 4; i++ {
+		idx := strings.IndexAny(s, " \t")
+		if idx == -1 {
+			return rr.String()
+		}
+		s = strings.TrimLeft(s[idx+1:], " \t")
+	}
+	if s == "" {
+		return rr.String()
+	}
+	return s
 }
 
 func isServiceBindingQuestion(req *dns.Msg) bool {
@@ -418,13 +444,24 @@ func (r *Router) routeInternal(ctx context.Context, req *dns.Msg) (*dns.Msg, str
 
 	var overseasResult, cnResult *dualResult
 	for i := 0; i < 2; i++ {
-		r := <-dualCh
-		rCopy := r
-		if r.source == "overseas" {
-			overseasResult = &rCopy
-		} else {
-			cnResult = &rCopy
+		select {
+		case res := <-dualCh:
+			rCopy := res
+			if res.source == "overseas" {
+				overseasResult = &rCopy
+			} else {
+				cnResult = &rCopy
+			}
+		case <-ctx.Done():
+			// 客户端已放弃/超时：不再空等另一路结果。
+			// dualCh 有 2 的缓冲，两个 goroutine 均可无阻塞退出。
+			return nil, "GeoIP(Timeout)", ctx.Err()
 		}
+	}
+
+	// 两个分支都已就绪，后续判断可安全解引用。
+	if overseasResult == nil || cnResult == nil {
+		return nil, "GeoIP(Error)", fmt.Errorf("并发查询未返回完整结果")
 	}
 
 	// 海外成功且有应答
@@ -471,5 +508,10 @@ func (r *Router) routeInternal(ctx context.Context, req *dns.Msg) (*dns.Msg, str
 	if overseasResult.err != nil {
 		return nil, "GeoIP(Error)", fmt.Errorf("所有DNS查询均失败: overseas=%v, cn=%v", overseasResult.err, cnResult.err)
 	}
-	return nil, "GeoIP(Error)", cnResult.err
+	if cnResult.err != nil {
+		return nil, "GeoIP(Error)", cnResult.err
+	}
+	// 两侧都是 (nil resp, nil err)：不能返回 (nil, nil)，
+	// 否则调用方按"成功"处理并解引用空指针。
+	return nil, "GeoIP(Error)", fmt.Errorf("并发查询未返回任何响应")
 }

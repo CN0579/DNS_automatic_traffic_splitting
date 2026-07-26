@@ -78,6 +78,96 @@ func TestTopStatsTrackBoundedHistory(t *testing.T) {
 	}
 }
 
+// 环形缓冲区在多次回绕后仍须保持"最新在前"的顺序，
+// 且分页、搜索、Top 统计都要与之一致。
+func TestRingBufferWrapAround(t *testing.T) {
+	const capacity = 4
+	logger := NewQueryLogger(true, capacity, 1, "", false)
+
+	// 写入 3 倍容量，强制多次回绕。
+	for i := 0; i < capacity*3+1; i++ {
+		logger.AddLog(&LogEntry{
+			ClientIP: "10.0.0.1",
+			Domain:   "d" + string(rune('a'+i)) + ".example",
+			Upstream: "Rule(CN)",
+		})
+	}
+
+	logs, total := logger.GetLogs(0, 10, "")
+	if total != capacity {
+		t.Fatalf("expected total=%d, got %d", capacity, total)
+	}
+	if len(logs) != capacity {
+		t.Fatalf("expected %d logs, got %d", capacity, len(logs))
+	}
+
+	// 最后写入的是 i=12 -> 'm'，倒序应为 m, l, k, j。
+	want := []string{"dm.example", "dl.example", "dk.example", "dj.example"}
+	for i, w := range want {
+		if logs[i].Domain != w {
+			t.Fatalf("log[%d]: expected %q, got %q", i, w, logs[i].Domain)
+		}
+	}
+
+	// ID 必须严格递减（最新在前）。
+	for i := 1; i < len(logs); i++ {
+		if logs[i-1].ID <= logs[i].ID {
+			t.Fatalf("expected descending IDs, got %d then %d", logs[i-1].ID, logs[i].ID)
+		}
+	}
+
+	// 分页跨越回绕点。
+	page2, _ := logger.GetLogs(2, 2, "")
+	if len(page2) != 2 || page2[0].Domain != "dk.example" || page2[1].Domain != "dj.example" {
+		t.Fatalf("unexpected page 2: %#v", page2)
+	}
+
+	// 被淘汰的条目不得再出现在搜索结果里。
+	old, oldTotal := logger.GetLogs(0, 10, "da.example")
+	if len(old) != 0 || oldTotal != 0 {
+		t.Fatalf("expected evicted entry to be unsearchable, got len=%d total=%d", len(old), oldTotal)
+	}
+
+	stats := logger.GetStats()
+	if stats.TotalQueries != int64(capacity*3+1) {
+		t.Fatalf("expected lifetime total %d, got %d", capacity*3+1, stats.TotalQueries)
+	}
+	if len(stats.TopDomains) != capacity {
+		t.Fatalf("expected %d tracked domains, got %d", capacity, len(stats.TopDomains))
+	}
+	if stats.TopClients["10.0.0.1"] != int64(capacity) {
+		t.Fatalf("expected client count %d, got %d", capacity, stats.TopClients["10.0.0.1"])
+	}
+}
+
+// QPS 窗口用起始下标而非搬移来淘汰过期样本，需验证压缩前后一致。
+func TestQPSWindowCompaction(t *testing.T) {
+	logger := NewQueryLogger(true, 1000, 1, "", false)
+	now := time.Now()
+
+	// 30 条早已过期的样本，随后 5 条在窗口内。
+	for i := 0; i < 30; i++ {
+		logger.AddLog(&LogEntry{Time: now.Add(-60 * time.Second)})
+	}
+	for i := 0; i < 5; i++ {
+		logger.AddLog(&LogEntry{Time: now.Add(-time.Duration(i) * time.Second)})
+	}
+
+	stats := logger.GetStats()
+	if stats.TotalQueries != 35 {
+		t.Fatalf("expected 35 total queries, got %d", stats.TotalQueries)
+	}
+	// 窗口内 5 条 / 10s = 0.5
+	if math.Abs(stats.QPS-0.5) > 0.05 {
+		t.Fatalf("expected QPS close to 0.5, got %.3f", stats.QPS)
+	}
+
+	logger.Clear()
+	if qps := logger.GetStats().QPS; qps != 0 {
+		t.Fatalf("expected QPS 0 after Clear, got %.3f", qps)
+	}
+}
+
 func TestSaveToFileUsesBoundedWriters(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "query.log")
 	before := runtime.NumGoroutine()

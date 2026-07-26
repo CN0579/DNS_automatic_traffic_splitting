@@ -46,17 +46,23 @@ type Stats struct {
 }
 
 type QueryLogger struct {
-	mu         sync.RWMutex
-	fileMu     sync.Mutex
-	enabled    bool
+	mu     sync.RWMutex
+	fileMu sync.Mutex
+
+	enabled bool
+	// logs 为环形缓冲区，logsStart 指向最旧的一条；
+	// 未写满前 logsStart 恒为 0。
 	logs       []*LogEntry
+	logsStart  int
 	maxSizeMB  int
 	maxHistory int
 	nextID     int64
 	filePath   string
 	saveToFile bool
-	recentLogs []time.Time
-	stats      Stats
+	// recentLogs 为 QPS 滑动窗口，recentStart 之前的元素已过期待回收。
+	recentLogs  []time.Time
+	recentStart int
+	stats       Stats
 
 	persistedLogCount int64
 	fileQueue         chan LogEntry
@@ -163,8 +169,14 @@ func (l *QueryLogger) restoreStatsFromFile() {
 	}
 }
 
+// Enabled 报告日志器是否会实际记录条目。调用方可据此跳过
+// 构造日志内容时昂贵的字符串格式化。
+func (l *QueryLogger) Enabled() bool {
+	return l != nil && l.enabled && !l.closed.Load()
+}
+
 func (l *QueryLogger) AddLog(entry *LogEntry) {
-	if !l.enabled || l.closed.Load() {
+	if l == nil || !l.enabled || l.closed.Load() {
 		return
 	}
 
@@ -239,6 +251,11 @@ func (l *QueryLogger) updateTotals(entry *LogEntry) {
 	}
 }
 
+// logAt 按从旧到新的逻辑序号返回环形缓冲区中的条目。
+func (l *QueryLogger) logAt(i int) *LogEntry {
+	return l.logs[(l.logsStart+i)%len(l.logs)]
+}
+
 func (l *QueryLogger) addToMemory(entry *LogEntry) {
 	l.stats.TopClients[entry.ClientIP]++
 	l.stats.TopDomains[entry.Domain]++
@@ -253,9 +270,11 @@ func (l *QueryLogger) addToMemory(entry *LogEntry) {
 		return
 	}
 
-	evicted := l.logs[0]
-	copy(l.logs, l.logs[1:])
-	l.logs[len(l.logs)-1] = entry
+	// 环形覆盖最旧的一条：旧实现每条日志都要 copy 整个切片
+	// （默认 5000 条指针），在高 QPS 下是显著的固定开销。
+	evicted := l.logs[l.logsStart]
+	l.logs[l.logsStart] = entry
+	l.logsStart = (l.logsStart + 1) % len(l.logs)
 	l.decrementTopCounters(evicted)
 }
 
@@ -280,16 +299,20 @@ func (l *QueryLogger) decrementTopCounters(entry *LogEntry) {
 func (l *QueryLogger) recordRecentLog(ts time.Time) {
 	l.recentLogs = append(l.recentLogs, ts)
 
+	// 只推进起始下标，不做逐条搬移；旧实现对每条查询都会
+	// copy 整个窗口（高 QPS 下可达数万个元素）。
 	cutoff := ts.Add(-qpsWindow)
-	firstValid := 0
-	for firstValid < len(l.recentLogs) && l.recentLogs[firstValid].Before(cutoff) {
-		firstValid++
+	for l.recentStart < len(l.recentLogs) && l.recentLogs[l.recentStart].Before(cutoff) {
+		l.recentStart++
 	}
-	if firstValid > 0 {
-		remaining := len(l.recentLogs) - firstValid
-		copy(l.recentLogs, l.recentLogs[firstValid:])
+
+	// 已丢弃的前缀过半时才真正压缩，均摊为 O(1)。
+	if l.recentStart > 0 && l.recentStart*2 >= len(l.recentLogs) {
+		remaining := len(l.recentLogs) - l.recentStart
+		copy(l.recentLogs, l.recentLogs[l.recentStart:])
 		clear(l.recentLogs[remaining:])
 		l.recentLogs = l.recentLogs[:remaining]
+		l.recentStart = 0
 	}
 }
 
@@ -419,14 +442,19 @@ func (l *QueryLogger) pruneLogFile(limitBytes int64) (int64, error) {
 }
 
 func (l *QueryLogger) GetLogs(offset, limit int, search string) ([]*LogEntry, int64) {
-	if !l.enabled {
+	if l == nil || !l.enabled {
 		return nil, 0
 	}
 
+	// 先在锁内取出所需字段，再释放锁执行文件 I/O。
+	// 若在 mu.RLock 下做整文件扫描，AddLog（每个 DNS 查询都会调用）
+	// 将阻塞在 mu.Lock 上，导致解析停顿数秒。
 	l.mu.RLock()
-	defer l.mu.RUnlock()
+	saveToFile := l.saveToFile
+	filePath := l.filePath
+	l.mu.RUnlock()
 
-	if l.saveToFile && l.filePath != "" {
+	if saveToFile && filePath != "" {
 		totalHint := int64(-1)
 		stopAfter := 0
 		if search == "" {
@@ -440,15 +468,18 @@ func (l *QueryLogger) GetLogs(offset, limit int, search string) ([]*LogEntry, in
 		}
 	}
 
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
 	if search == "" {
 		total := len(l.logs)
-		if total == 0 || offset >= total {
+		if total == 0 || offset >= total || offset < 0 {
 			return nil, int64(total)
 		}
 
 		result := make([]*LogEntry, 0, min(limit, total-offset))
 		for i := total - 1 - offset; i >= 0 && len(result) < limit; i-- {
-			result = append(result, l.logs[i])
+			result = append(result, l.logAt(i))
 		}
 		return result, int64(total)
 	}
@@ -458,7 +489,7 @@ func (l *QueryLogger) GetLogs(offset, limit int, search string) ([]*LogEntry, in
 	searchLower := strings.ToLower(search)
 
 	for i := len(l.logs) - 1; i >= 0; i-- {
-		entry := l.logs[i]
+		entry := l.logAt(i)
 
 		if !matches(entry, searchLower) {
 			continue
@@ -583,6 +614,14 @@ func matches(entry *LogEntry, searchLower string) bool {
 }
 
 func (l *QueryLogger) GetStats() Stats {
+	if l == nil {
+		return Stats{
+			StartTime:  time.Now(),
+			TopClients: make(map[string]int64),
+			TopDomains: make(map[string]int64),
+		}
+	}
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -601,13 +640,13 @@ func (l *QueryLogger) GetStats() Stats {
 }
 
 func (l *QueryLogger) currentQPS(now time.Time) float64 {
-	if len(l.recentLogs) == 0 {
+	if l.recentStart >= len(l.recentLogs) {
 		return 0
 	}
 
 	cutoff := now.Add(-qpsWindow)
 	recentCount := 0
-	for i := len(l.recentLogs) - 1; i >= 0; i-- {
+	for i := len(l.recentLogs) - 1; i >= l.recentStart; i-- {
 		if l.recentLogs[i].Before(cutoff) {
 			break
 		}
@@ -622,7 +661,9 @@ func (l *QueryLogger) Clear() {
 	defer l.mu.Unlock()
 
 	l.logs = make([]*LogEntry, 0, l.maxHistory)
+	l.logsStart = 0
 	l.recentLogs = nil
+	l.recentStart = 0
 	l.stats.TopClients = make(map[string]int64)
 	l.stats.TopDomains = make(map[string]int64)
 }

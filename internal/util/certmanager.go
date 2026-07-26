@@ -33,7 +33,9 @@ func NewCertManager(cfg *config.Config) (*CertManager, error) {
 	if certDir == "" {
 		certDir = "certs"
 	}
-	if err := os.MkdirAll(certDir, 0755); err != nil {
+	// 0700：该目录存放 ACME 账户密钥与证书私钥，
+	// 0755 会让同机上的其它用户能够遍历目录名并探测证书状态。
+	if err := os.MkdirAll(certDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create cert dir: %w", err)
 	}
 

@@ -75,15 +75,20 @@ func (c *TCPClient) resolvePipeline(ctx context.Context, req *dns.Msg) (*dns.Msg
 		return nil, ctx.Err()
 	}
 
+	// 无论成功与否都必须归还槽位：conn 为 nil 表示一个空槽位，
+	// 若直接返回会永久性地缩小连接池，最终导致所有请求阻塞至超时。
 	defer func() {
-		if conn == nil {
-			return
-		}
-		if c.closed.Load() {
+		if conn != nil && c.closed.Load() {
 			conn.Close()
-			return
+			conn = nil
 		}
-		c.pool <- conn
+		select {
+		case c.pool <- conn:
+		default:
+			if conn != nil {
+				conn.Close()
+			}
+		}
 	}()
 
 	var err error
