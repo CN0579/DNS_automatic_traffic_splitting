@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -62,17 +64,20 @@ func (s *DNSServer) Start() {
 }
 
 func (s *DNSServer) Stop() error {
+	// 两个监听器都必须尝试关闭：旧实现在 UDP 关闭失败时直接返回，
+	// 会把 TCP 监听器泄漏下去并占住端口，导致后续 reload 无法重新绑定。
+	var errs []error
 	if s.udpServer != nil {
 		if err := s.udpServer.Shutdown(); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("UDP: %w", err))
 		}
 	}
 	if s.tcpServer != nil {
 		if err := s.tcpServer.Shutdown(); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("TCP: %w", err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 type DNSRequestHandler struct {
@@ -99,5 +104,23 @@ func (h *DNSRequestHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	w.WriteMsg(resp)
+	// UDP 上超出客户端通告尺寸的应答必须截断并置 TC 位（RFC 1035 §4.2.1、
+	// RFC 6891 §6.2.4），否则 Pack 失败、客户端只能等待超时。
+	if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
+		resp.Truncate(udpResponseSize(req))
+	}
+
+	if err := w.WriteMsg(resp); err != nil {
+		log.Printf("Error writing DNS response for %s: %v", qName, err)
+	}
+}
+
+// udpResponseSize 返回客户端可接收的最大 UDP 应答尺寸。
+func udpResponseSize(req *dns.Msg) int {
+	if opt := req.IsEdns0(); opt != nil {
+		if size := int(opt.UDPSize()); size >= dns.MinMsgSize {
+			return size
+		}
+	}
+	return dns.MinMsgSize
 }

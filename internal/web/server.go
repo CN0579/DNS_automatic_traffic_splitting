@@ -2,13 +2,17 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"doh-autoproxy/internal/client"
 	"doh-autoproxy/internal/config"
 	"doh-autoproxy/internal/manager"
 	"doh-autoproxy/internal/resolver"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -30,6 +34,25 @@ var (
 )
 
 const topStatsLimit = 20
+
+// maxAPIBodySize 限制 API 请求体大小，避免恶意请求耗尽内存。
+// 配置中可能包含大量 hosts 条目，故留出较宽裕的额度。
+const maxAPIBodySize = 32 << 20
+
+// newSessionToken 生成不可预测的会话令牌。
+// 旧实现使用 time.Now().UnixNano()，攻击者可猜测登录时刻从而伪造会话。
+func newSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// decodeJSONBody 在限制请求体大小后解码 JSON。
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	return json.NewDecoder(io.LimitReader(http.MaxBytesReader(w, r.Body, maxAPIBodySize), maxAPIBodySize)).Decode(dst)
+}
 
 type DashboardStats struct {
 	UptimeSeconds    int64            `json:"uptime_seconds"`
@@ -61,7 +84,7 @@ type TestResult struct {
 }
 
 func StartWebServer(mgr *manager.ServiceManager) {
-	cfg := mgr.Config
+	cfg := mgr.CurrentConfig()
 
 	if !cfg.WebUI.Enabled {
 		return
@@ -75,7 +98,8 @@ func StartWebServer(mgr *manager.ServiceManager) {
 	mux := http.NewServeMux()
 
 	checkAuth := func(r *http.Request) bool {
-		if mgr.Config.WebUI.Username == "" || mgr.Config.WebUI.Password == "" {
+		c := mgr.CurrentConfig()
+		if c.WebUI.Username == "" || c.WebUI.Password == "" {
 			return true
 		}
 		cookie, err := r.Cookie("session_token")
@@ -94,9 +118,10 @@ func StartWebServer(mgr *manager.ServiceManager) {
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 
-		enabled := mgr.Config.WebUI.Username != "" && mgr.Config.WebUI.Password != ""
+		c := mgr.CurrentConfig()
+		enabled := c.WebUI.Username != "" && c.WebUI.Password != ""
 		authenticated := checkAuth(r)
-		guestMode := mgr.Config.WebUI.GuestMode
+		guestMode := c.WebUI.GuestMode
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -115,13 +140,21 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		if err := decodeJSONBody(w, r, &creds); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
 
-		if creds.Username == mgr.Config.WebUI.Username && creds.Password == mgr.Config.WebUI.Password {
-			token := fmt.Sprintf("%d", time.Now().UnixNano())
+		c := mgr.CurrentConfig()
+		// 使用常量时间比较，避免通过响应耗时逐字节推断用户名/密码。
+		userOK := subtle.ConstantTimeCompare([]byte(creds.Username), []byte(c.WebUI.Username)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(creds.Password), []byte(c.WebUI.Password)) == 1
+		if userOK && passOK {
+			token, err := newSessionToken()
+			if err != nil {
+				http.Error(w, "Failed to create session", http.StatusInternalServerError)
+				return
+			}
 			expiry := time.Now().Add(24 * time.Hour)
 
 			sessionMu.Lock()
@@ -130,12 +163,15 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			sessionMu.Unlock()
 
 			http.SetCookie(w, &http.Cookie{
-				Name:     "session_token",
-				Value:    token,
-				Expires:  expiry,
-				MaxAge:   86400,
+				Name:    "session_token",
+				Value:   token,
+				Expires: expiry,
+				MaxAge:  86400,
+				// SameSite=Strict：Lax 仍会在顶层导航时携带 Cookie，
+				// 配合本服务的状态变更接口不足以防御 CSRF。
 				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
+				Secure:   r.TLS != nil,
+				SameSite: http.SameSiteStrictMode,
 				Path:     "/",
 			})
 			w.WriteHeader(http.StatusOK)
@@ -156,17 +192,18 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			Expires:  time.Now().Add(-1 * time.Hour),
 			MaxAge:   -1,
 			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
+			Secure:   r.TLS != nil,
+			SameSite: http.SameSiteStrictMode,
 			Path:     "/",
 		})
 		w.WriteHeader(http.StatusOK)
 	})
 
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		currentCfg := mgr.Config
+		currentCfg := mgr.CurrentConfig()
 
 		if r.Method == http.MethodGet {
-			if !mgr.Config.WebUI.GuestMode && !checkAuth(r) {
+			if !currentCfg.WebUI.GuestMode && !checkAuth(r) {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -187,17 +224,17 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			}
 
 			var newCfg config.Config
-			if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+			if err := decodeJSONBody(w, r, &newCfg); err != nil {
 				http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
 			}
 
 			if newCfg.WebUI.Password == "******" {
-				newCfg.WebUI.Password = mgr.Config.WebUI.Password
+				newCfg.WebUI.Password = currentCfg.WebUI.Password
 			}
 
-			newCfg.Hosts = make(map[string]string)
-			for k, v := range mgr.Config.Hosts {
+			newCfg.Hosts = make(map[string]string, len(currentCfg.Hosts))
+			for k, v := range currentCfg.Hosts {
 				newCfg.Hosts[k] = v
 			}
 
@@ -221,7 +258,8 @@ func StartWebServer(mgr *manager.ServiceManager) {
 	})
 
 	mux.HandleFunc("/api/hosts", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r) && (!mgr.Config.WebUI.GuestMode || r.Method != http.MethodGet) {
+		currentCfg := mgr.CurrentConfig()
+		if !checkAuth(r) && (!currentCfg.WebUI.GuestMode || r.Method != http.MethodGet) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -250,7 +288,7 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			}
 
 			var allHosts []HostEntry
-			for k, v := range mgr.Config.Hosts {
+			for k, v := range currentCfg.Hosts {
 				if q == "" || strings.Contains(k, q) || strings.Contains(v, q) {
 					allHosts = append(allHosts, HostEntry{Domain: k, IP: v})
 				}
@@ -261,12 +299,14 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			})
 
 			total := len(allHosts)
+			// page/limit 来自用户输入，(page-1)*limit 可能溢出为负数，
+			// 需在切片前把 start/end 夹到 [0, total]。
 			start := (page - 1) * limit
-			end := start + limit
-			if start > total {
+			if start < 0 || start > total {
 				start = total
 			}
-			if end > total {
+			end := start + limit
+			if end < start || end > total {
 				end = total
 			}
 
@@ -287,14 +327,14 @@ func StartWebServer(mgr *manager.ServiceManager) {
 					IP     string `json:"ip"`
 				} `json:"hosts"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			if err := decodeJSONBody(w, r, &payload); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 
-			newCfg := *mgr.Config
-			newCfg.Hosts = make(map[string]string)
-			for k, v := range mgr.Config.Hosts {
+			newCfg := *currentCfg
+			newCfg.Hosts = make(map[string]string, len(currentCfg.Hosts)+len(payload.Hosts))
+			for k, v := range currentCfg.Hosts {
 				newCfg.Hosts[k] = v
 			}
 
@@ -319,14 +359,14 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			var payload struct {
 				Domains []string `json:"domains"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			if err := decodeJSONBody(w, r, &payload); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 
-			newCfg := *mgr.Config
-			newCfg.Hosts = make(map[string]string)
-			for k, v := range mgr.Config.Hosts {
+			newCfg := *currentCfg
+			newCfg.Hosts = make(map[string]string, len(currentCfg.Hosts))
+			for k, v := range currentCfg.Hosts {
 				newCfg.Hosts[k] = v
 			}
 
@@ -362,7 +402,7 @@ func StartWebServer(mgr *manager.ServiceManager) {
 		}
 
 		var tempCfg config.Config
-		if err := json.NewDecoder(r.Body).Decode(&tempCfg); err != nil {
+		if err := decodeJSONBody(w, r, &tempCfg); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -430,7 +470,8 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			return
 		}
 
-		if !mgr.Config.WebUI.GuestMode && !checkAuth(r) {
+		currentCfg, _, queryLog := mgr.Snapshot()
+		if !currentCfg.WebUI.GuestMode && !checkAuth(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -446,12 +487,15 @@ func StartWebServer(mgr *manager.ServiceManager) {
 		}
 
 		offset := (page - 1) * limit
+		if offset < 0 {
+			offset = 0
+		}
 		query := r.URL.Query().Get("q")
 		if query == "" {
 			query = r.URL.Query().Get("ip")
 		}
 
-		logs, total := mgr.QueryLog.GetLogs(offset, limit, query)
+		logs, total := queryLog.GetLogs(offset, limit, query)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -468,7 +512,10 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			return
 		}
 
-		if !mgr.Config.WebUI.GuestMode && !checkAuth(r) {
+		// 一次性取出配置/路由/日志器的快照：Reload() 会整体替换这三个字段，
+		// 逐次读取既有数据竞争，也可能拿到互不一致的组合。
+		currentCfg, rt, queryLog := mgr.Snapshot()
+		if !currentCfg.WebUI.GuestMode && !checkAuth(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -476,8 +523,7 @@ func StartWebServer(mgr *manager.ServiceManager) {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 
-		stats := mgr.QueryLog.GetStats()
-		currentCfg := mgr.Config
+		stats := queryLog.GetStats()
 
 		resp := DashboardStats{
 			UptimeSeconds:    int64(time.Since(stats.StartTime).Seconds()),
@@ -498,9 +544,7 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			TopDomains:       limitCountMap(stats.TopDomains, topStatsLimit),
 		}
 
-		if mgr.Router != nil {
-			resp.UpstreamStats = mgr.Router.GetUpstreamStats()
-		}
+		resp.UpstreamStats = rt.GetUpstreamStats()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -508,27 +552,40 @@ func StartWebServer(mgr *manager.ServiceManager) {
 
 	uiAssets, err := fs.Sub(uiFS, "ui")
 	if err != nil {
-		log.Fatalf("Failed to embed UI: %v", err)
+		// 不使用 log.Fatalf：WebUI 资源缺失不应终止 DNS 服务本身。
+		log.Printf("Warning: Failed to embed UI, WebUI not started: %v", err)
+		return
 	}
 	mux.Handle("/", http.FileServer(http.FS(uiAssets)))
+
+	// 显式设置超时：默认的 http.ListenAndServe 无任何超时，
+	// 慢速请求（Slowloris）可耗尽连接。
+	newServer := func() *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			WriteTimeout:      120 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	}
 
 	go func() {
 		certManager := mgr.GetCertManager()
 
 		if cfg.WebUI.CertFile != "" && cfg.WebUI.KeyFile != "" {
+			server := newServer()
 			log.Printf("WebUI HTTPS started on https://%s (manual cert)", addr)
-			if err := http.ListenAndServeTLS(addr, cfg.WebUI.CertFile, cfg.WebUI.KeyFile, mux); err != nil {
+			if err := server.ListenAndServeTLS(cfg.WebUI.CertFile, cfg.WebUI.KeyFile); err != nil {
 				log.Printf("WebUI HTTPS server failed: %v", err)
 			}
 			return
 		}
 
 		if cfg.AutoCert.Enabled && certManager != nil {
-			server := &http.Server{
-				Addr:      addr,
-				Handler:   mux,
-				TLSConfig: certManager.TLSConfig(),
-			}
+			server := newServer()
+			server.TLSConfig = certManager.TLSConfig()
 			log.Printf("WebUI HTTPS started on https://%s (auto cert)", addr)
 			if err := server.ListenAndServeTLS("", ""); err != nil {
 				log.Printf("WebUI HTTPS server failed: %v", err)
@@ -536,8 +593,9 @@ func StartWebServer(mgr *manager.ServiceManager) {
 			return
 		}
 
+		server := newServer()
 		log.Printf("WebUI HTTP started on http://%s", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			log.Printf("WebUI HTTP server failed: %v", err)
 		}
 	}()

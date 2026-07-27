@@ -22,6 +22,8 @@ type ServiceManager struct {
 	mu     sync.Mutex
 	Config *config.Config
 
+	stopOnce sync.Once
+
 	GeoManager  *router.GeoDataManager
 	Router      *router.Router
 	CertManager *util.CertManager
@@ -54,15 +56,42 @@ func (m *ServiceManager) Start() error {
 }
 
 func (m *ServiceManager) Stop() error {
+	// 关闭而非发送：非阻塞发送在 runAutoUpdate 未停在 select 上时会被
+	// default 分支丢弃，导致停止信号丢失、goroutine 泄漏，
+	// 并可能在服务停止后重新拉起所有监听器。
+	m.stopOnce.Do(func() {
+		close(m.stopAutoUpdate)
+	})
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	select {
-	case m.stopAutoUpdate <- struct{}{}:
-	default:
-	}
-
 	return m.stopInternal()
+}
+
+// Snapshot 在持有锁的情况下返回当前的运行时组件，供 Web 处理器等外部调用方使用。
+// 直接读取字段会与 Reload() 中的置空/替换产生数据竞争和 nil 解引用 panic。
+func (m *ServiceManager) Snapshot() (*config.Config, *router.Router, *querylog.QueryLogger) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Config, m.Router, m.QueryLog
+}
+
+// CurrentConfig 在持有锁的情况下返回当前配置。
+func (m *ServiceManager) CurrentConfig() *config.Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Config
+}
+
+// stopped 报告是否已请求停止。
+func (m *ServiceManager) stopped() bool {
+	select {
+	case <-m.stopAutoUpdate:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *ServiceManager) Reload(newCfg *config.Config) error {
@@ -97,13 +126,45 @@ func (m *ServiceManager) Reload(newCfg *config.Config) error {
 		}
 	}
 
+	oldCfg := m.Config
 	m.Config = newCfg
 
 	if err := m.startInternal(); err != nil {
+		// 新配置启动失败时回滚到旧配置，否则所有监听器都已停止，
+		// 服务将彻底不可用，只能靠人工重启恢复。
+		log.Printf("新配置启动失败，正在回滚: %v", err)
+		m.Config = oldCfg
+		m.GeoManager = nil
+		if stopErr := m.stopInternal(); stopErr != nil {
+			log.Printf("Warning: 回滚前停止服务出错: %v", stopErr)
+		}
+		if rollbackErr := m.startInternal(); rollbackErr != nil {
+			return fmt.Errorf("failed to restart services: %w (回滚同样失败: %v)", err, rollbackErr)
+		}
+		log.Println("已回滚到上一份可用配置")
 		return fmt.Errorf("failed to restart services: %w", err)
 	}
 
 	log.Println("服务配置重载完成")
+	return nil
+}
+
+// reloadCurrent 使用当前配置就地重启服务，并强制重新加载 Geo 数据库。
+// 与 Reload 不同，它不会替换 m.Config，因此不会覆盖并发保存的新配置。
+func (m *ServiceManager) reloadCurrent() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.GeoManager = nil
+	debug.FreeOSMemory()
+
+	if err := m.stopInternal(); err != nil {
+		log.Printf("Warning: Error stopping services during geo reload: %v", err)
+	}
+
+	if err := m.startInternal(); err != nil {
+		return fmt.Errorf("failed to restart services: %w", err)
+	}
 	return nil
 }
 
@@ -116,7 +177,7 @@ func (m *ServiceManager) CheckAndDownloadGeoFiles() {
 		return fi.Size() == 0
 	}
 
-	cfg := m.Config
+	cfg := m.CurrentConfig()
 
 	if shouldDownload(cfg.GeoData.GeoIPDat) {
 		if cfg.GeoData.GeoIPDownloadURL != "" {
@@ -142,7 +203,13 @@ func (m *ServiceManager) CheckAndDownloadGeoFiles() {
 }
 
 func (m *ServiceManager) ForceDownloadGeoFiles() {
-	cfg := m.Config
+	m.downloadGeoFiles(m.CurrentConfig())
+}
+
+func (m *ServiceManager) downloadGeoFiles(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
 	if cfg.GeoData.GeoIPDownloadURL != "" {
 		log.Printf("正在自动更新 GeoIP 数据...")
 		if err := util.DownloadFile(cfg.GeoData.GeoIPDat, cfg.GeoData.GeoIPDownloadURL, router.VerifyGeoIP); err != nil {
@@ -169,8 +236,9 @@ func (m *ServiceManager) runAutoUpdate() {
 			return
 		case <-ticker.C:
 			m.mu.Lock()
-			autoUpdate := m.Config.GeoData.AutoUpdate
-			geoIPFile := m.Config.GeoData.GeoIPDat
+			cfg := m.Config
+			autoUpdate := cfg.GeoData.AutoUpdate
+			geoIPFile := cfg.GeoData.GeoIPDat
 			m.mu.Unlock()
 
 			if autoUpdate == "" {
@@ -178,10 +246,10 @@ func (m *ServiceManager) runAutoUpdate() {
 			}
 
 			now := time.Now()
-			loc, err := time.LoadLocation("Asia/Shanghai")
-			if err == nil {
+			if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
 				now = now.In(loc)
 			} else {
+				log.Printf("无法加载时区 Asia/Shanghai，回退到本地时区: %v", err)
 			}
 
 			parsed, err := time.Parse("15:04", autoUpdate)
@@ -213,14 +281,15 @@ func (m *ServiceManager) runAutoUpdate() {
 				log.Println("触发计划的 Geo 数据更新 (检测到数据过时)...")
 				lastAttempt = time.Now()
 
-				m.ForceDownloadGeoFiles()
+				// 下载可能耗时数分钟，期间可能收到停止信号。
+				m.downloadGeoFiles(cfg)
+				if m.stopped() {
+					return
+				}
 
-				m.mu.Lock()
-				m.GeoManager = nil
-				debug.FreeOSMemory()
-				m.mu.Unlock()
-
-				if err := m.Reload(m.Config); err != nil {
+				// 使用当前配置就地重启，避免把可能已过期的 cfg 指针
+				// 写回 m.Config 而覆盖掉期间保存的新配置。
+				if err := m.reloadCurrent(); err != nil {
 					log.Printf("Geo 更新后重载失败: %v", err)
 				}
 			}
@@ -366,5 +435,7 @@ func (m *ServiceManager) stopInternal() error {
 }
 
 func (m *ServiceManager) GetCertManager() *util.CertManager {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.CertManager
 }

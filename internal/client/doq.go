@@ -32,19 +32,26 @@ func NewDoQClient(cfg config.UpstreamServer, b *resolver.Bootstrapper) *DoQClien
 func (c *DoQClient) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	ensureECS(req, c.cfg.ECSIP)
 
-	msgBuf, err := req.Pack()
+	// RFC 9250 §4.2.1: DoQ 报文的 Message ID 必须为 0；
+	// 使用副本以免修改调用方持有的请求。
+	originalID := req.Id
+	wireReq := req.Copy()
+	wireReq.Id = 0
+
+	msgBuf, err := wireReq.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("打包DNS消息失败: %w", err)
 	}
 
 	addrStr := strings.TrimPrefix(c.cfg.Address, "quic://")
-	if !strings.Contains(addrStr, ":") {
-		addrStr = net.JoinHostPort(addrStr, "853")
-	}
-
+	// 用 SplitHostPort 探测而非查找 ":"，否则裸 IPv6 地址 (如 "2001:db8::1")
+	// 会被误判为已带端口。
 	host, port, err := net.SplitHostPort(addrStr)
 	if err != nil {
-		return nil, err
+		host, port, err = net.SplitHostPort(net.JoinHostPort(addrStr, "853"))
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %s: %w", c.cfg.Address, err)
+		}
 	}
 
 	ip, err := c.bootstrapper.LookupIP(ctx, host)
@@ -101,6 +108,9 @@ func (c *DoQClient) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	if err != nil {
 		return nil, fmt.Errorf("解包DoQ响应消息失败: %w", err)
 	}
+
+	// 还原调用方期望的 Message ID。
+	responseMsg.Id = originalID
 
 	return responseMsg, nil
 }

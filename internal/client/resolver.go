@@ -46,6 +46,12 @@ func RaceResolve(ctx context.Context, req *dns.Msg, clients []DNSClient) (*dns.M
 				lastErr = r.err
 				continue
 			}
+			// 防御性判空：上游实现若返回 (nil, nil)，
+			// 直接访问 r.resp.Rcode 会 panic 并拖垮整个进程。
+			if r.resp == nil {
+				lastErr = fmt.Errorf("上游返回了空响应")
+				continue
+			}
 			// 真正成功的响应（NOERROR），立即返回
 			if r.resp.Rcode == dns.RcodeSuccess {
 				return r.resp, nil

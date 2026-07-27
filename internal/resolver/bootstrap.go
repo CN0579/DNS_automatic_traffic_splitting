@@ -15,6 +15,13 @@ type cacheEntry struct {
 	expiry time.Time
 }
 
+// inflight 用于合并同一域名的并发解析请求。
+type inflight struct {
+	done chan struct{}
+	ip   string
+	err  error
+}
+
 type bootstrapServer struct {
 	network string
 	address string
@@ -31,7 +38,20 @@ type Bootstrapper struct {
 	servers  []bootstrapServer
 	counter  uint64
 	cache    sync.Map
+	pending  sync.Map
 	cacheTTL time.Duration
+	// staleTTL 为过期条目的宽限期：上游解析暂时失败时，
+	// 宁可复用略旧的 IP，也好过让所有上游同时不可用。
+	staleTTL time.Duration
+	// resolve 供测试注入；为空时使用 lookupWithRetry。
+	resolve func(ctx context.Context, host string) (string, error)
+}
+
+func (b *Bootstrapper) resolveHost(ctx context.Context, host string) (string, error) {
+	if b.resolve != nil {
+		return b.resolve(ctx, host)
+	}
+	return b.lookupWithRetry(ctx, host)
 }
 
 func NewBootstrapper(servers []string) *Bootstrapper {
@@ -46,6 +66,7 @@ func NewBootstrapper(servers []string) *Bootstrapper {
 	return &Bootstrapper{
 		servers:  normalized,
 		cacheTTL: 5 * time.Minute,
+		staleTTL: 1 * time.Hour,
 	}
 }
 
@@ -85,27 +106,69 @@ func (b *Bootstrapper) LookupIP(ctx context.Context, host string) (string, error
 		return host, nil
 	}
 
-	// 查缓存
+	// 查缓存：过期条目先保留，解析失败时可作为兜底。
+	var stale *cacheEntry
 	if entry, ok := b.cache.Load(host); ok {
 		ce := entry.(*cacheEntry)
 		if time.Now().Before(ce.expiry) {
 			return ce.ip, nil
 		}
-		b.cache.Delete(host)
+		stale = ce
 	}
 
-	ip, err := b.lookupWithRetry(ctx, host)
+	ip, err := b.lookupOnce(ctx, host)
 	if err != nil {
+		// 解析失败时回退到宽限期内的旧记录：短暂的 bootstrap 抖动
+		// 不应让所有上游同时不可用。
+		if stale != nil && time.Now().Before(stale.expiry.Add(b.staleTTL)) {
+			return stale.ip, nil
+		}
+		b.cache.Delete(host)
 		return "", err
 	}
 
-	// 写入缓存
-	b.cache.Store(host, &cacheEntry{
-		ip:     ip,
-		expiry: time.Now().Add(b.cacheTTL),
-	})
-
 	return ip, nil
+}
+
+// lookupOnce 合并同一域名的并发解析：缓存过期瞬间可能有数十个查询
+// 同时到达，各自发起一次耗时数秒的 bootstrap 解析纯属浪费。
+func (b *Bootstrapper) lookupOnce(ctx context.Context, host string) (string, error) {
+	fl := &inflight{done: make(chan struct{})}
+	actual, loaded := b.pending.LoadOrStore(host, fl)
+	if loaded {
+		leader := actual.(*inflight)
+		select {
+		case <-leader.done:
+			return leader.ip, leader.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	// 本 goroutine 为首个请求者，负责实际解析。
+	// 使用独立的 context，避免首个请求者被取消后
+	// 拖累所有等待者。
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	go func() {
+		defer cancel()
+		defer b.pending.Delete(host)
+		defer close(fl.done)
+
+		fl.ip, fl.err = b.resolveHost(lookupCtx, host)
+		if fl.err == nil {
+			b.cache.Store(host, &cacheEntry{
+				ip:     fl.ip,
+				expiry: time.Now().Add(b.cacheTTL),
+			})
+		}
+	}()
+
+	select {
+	case <-fl.done:
+		return fl.ip, fl.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 func (b *Bootstrapper) lookupWithRetry(ctx context.Context, host string) (string, error) {

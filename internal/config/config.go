@@ -2,15 +2,21 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
+
+// saveMu 串行化配置落盘：config.yaml / hosts.txt / rule.txt 三个文件
+// 必须作为一个整体写入，否则并发保存会产生互相矛盾的组合。
+var saveMu sync.Mutex
 
 type Config struct {
 	Listen          ListenConfig      `yaml:"listen" json:"listen"`
@@ -115,7 +121,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	configDir := filepath.Dir(absPath)
 
-	data, err := ioutil.ReadFile(absPath)
+	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("无法读取配置文件 %s: %w", absPath, err)
 	}
@@ -202,6 +208,9 @@ func hasNestedKey(root map[string]interface{}, keys ...string) bool {
 }
 
 func (c *Config) Save(configPath string) error {
+	saveMu.Lock()
+	defer saveMu.Unlock()
+
 	absPath, err := filepath.Abs(configPath)
 	if err != nil {
 		return err
@@ -228,7 +237,8 @@ func (c *Config) Save(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("无法序列化配置: %w", err)
 	}
-	if err := ioutil.WriteFile(absPath, data, 0644); err != nil {
+	// 配置内含 WebUI 明文密码，使用 0600 而非 0644。
+	if err := writeFileAtomic(absPath, data, 0600); err != nil {
 		return fmt.Errorf("无法写入配置文件 %s: %w", absPath, err)
 	}
 
@@ -245,36 +255,68 @@ func (c *Config) Save(configPath string) error {
 	return nil
 }
 
-func saveHostsFile(path string, hosts map[string]string) error {
-	f, err := os.Create(path)
+// writeFileAtomic 先写临时文件再 rename，避免"截断后写入失败"
+// 导致配置文件被清空——旧实现的 os.Create/WriteFile 在磁盘写满或
+// 进程被杀时会留下空文件甚至半截配置。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName) // rename 成功后此调用无副作用
+	}()
 
-	w := bufio.NewWriter(f)
-	for domain, ip := range hosts {
-		if _, err := fmt.Fprintf(w, "%s %s\n", ip, domain); err != nil {
-			return err
-		}
+	if _, err := tmp.Write(data); err != nil {
+		return err
 	}
-	return w.Flush()
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// marshalPairs 以域名排序输出 "key value" 行，保证同样的内容
+// 每次生成一致的文件（Go 的 map 遍历顺序随机，旧实现会让
+// hosts.txt/rule.txt 每次保存都产生无意义的全文件 diff）。
+func marshalPairs(m map[string]string, line func(k, v string) string) []byte {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var buf bytes.Buffer
+	// 预估每行长度，减少扩容次数。
+	buf.Grow(len(keys) * 48)
+	for _, k := range keys {
+		buf.WriteString(line(k, m[k]))
+		buf.WriteByte('\n')
+	}
+	return buf.Bytes()
+}
+
+func saveHostsFile(path string, hosts map[string]string) error {
+	data := marshalPairs(hosts, func(domain, ip string) string {
+		return ip + " " + domain
+	})
+	return writeFileAtomic(path, data, 0644)
 }
 
 func saveRulesFile(path string, rules map[string]string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	for domain, target := range rules {
-		if _, err := fmt.Fprintf(w, "%s %s\n", domain, target); err != nil {
-			return err
-		}
-	}
-	return w.Flush()
+	data := marshalPairs(rules, func(domain, target string) string {
+		return domain + " " + target
+	})
+	return writeFileAtomic(path, data, 0644)
 }
 
 func loadHostsFile(path string, hosts map[string]string) error {

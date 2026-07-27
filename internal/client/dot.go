@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,15 +78,20 @@ func (c *DoTClient) resolvePipeline(ctx context.Context, req *dns.Msg) (*dns.Msg
 		return nil, ctx.Err()
 	}
 
+	// 无论成功与否都必须归还槽位：conn 为 nil 表示一个空槽位，
+	// 若直接返回会永久性地缩小连接池，最终导致所有请求阻塞至超时。
 	defer func() {
-		if conn == nil {
-			return
-		}
-		if c.closed.Load() {
+		if conn != nil && c.closed.Load() {
 			conn.Close()
-			return
+			conn = nil
 		}
-		c.pool <- conn
+		select {
+		case c.pool <- conn:
+		default:
+			if conn != nil {
+				conn.Close()
+			}
+		}
 	}()
 
 	var err error
@@ -130,10 +136,7 @@ func (c *DoTClient) resolvePipeline(ctx context.Context, req *dns.Msg) (*dns.Msg
 }
 
 func (c *DoTClient) prepare(ctx context.Context) (string, *tls.Config, error) {
-	rawAddr := c.cfg.Address
-	if len(rawAddr) > 6 && rawAddr[:6] == "tls://" {
-		rawAddr = rawAddr[6:]
-	}
+	rawAddr := strings.TrimPrefix(c.cfg.Address, "tls://")
 
 	if _, _, err := net.SplitHostPort(rawAddr); err != nil {
 		rawAddr = net.JoinHostPort(rawAddr, "853")
@@ -150,9 +153,13 @@ func (c *DoTClient) prepare(ctx context.Context) (string, *tls.Config, error) {
 	}
 
 	addr := net.JoinHostPort(ip, port)
+	// 客户端故意不通告 ALPN：若上游只配置了其它协议标识，
+	// Go 会以 "unsupported application protocol" 直接握手失败；
+	// 不发送 ALPN 则对两类上游都兼容。
 	tlsConfig := &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: c.cfg.InsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
 	}
 
 	return addr, tlsConfig, nil

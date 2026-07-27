@@ -40,6 +40,8 @@ func main() {
 	<-sigChan
 
 	log.Println("收到关闭信号，正在停止服务...")
-	svcMgr.Stop()
+	if err := svcMgr.Stop(); err != nil {
+		log.Printf("停止服务时出错: %v", err)
+	}
 	log.Println("服务已停止")
 }
